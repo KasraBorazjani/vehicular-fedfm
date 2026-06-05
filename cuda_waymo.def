@@ -1,0 +1,40 @@
+# cuda_waymo.def
+Bootstrap: localimage
+From: ./cuda_11.8.0-cudnn8-devel-ubuntu22.04.sif
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    export LC_ALL=C
+    export LANG=C
+
+    echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/no-sandbox
+
+    apt-get update && apt-get install -y \
+        --no-install-recommends \
+        python3 \
+        python3-pip \
+        curl \
+        git \
+        patchelf \
+        build-essential \
+        ca-certificates
+
+    pip install "jax[cuda11_pip]==0.4.13" \
+        -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+    pip install gcsfs==2023.12.2.post1 --no-deps
+    pip install aiohttp "google-cloud-storage==2.8.0" "fsspec==2023.12.2"
+    pip install waymo-open-dataset-tf-2-12-0==1.6.7
+    pip install \
+        jupyter \
+        jupyterlab \
+        notebook \
+        ipykernel \
+        "ipywidgets>=7.5" \
+        "protobuf<5.0.0" \
+        "typing-extensions<4.6.0" \
+        "google-auth==2.16.2" \
+        "grpcio-status<1.49.0"
+    pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu118
+
+%runscript
+    jupyter notebook --no-browser --ip=0.0.0.0 --allow-root --port=8888 --notebook-dir=/notebooks

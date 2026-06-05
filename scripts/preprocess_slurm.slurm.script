@@ -1,0 +1,54 @@
+#!/bin/bash
+#SBATCH --job-name=waymo_preprocess
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4                   # 1 per worker + overhead
+#SBATCH --mem=96G                           # 2 workers × ~25 GB peak each
+#SBATCH --time=20:00:00                     # ~16 hrs for 798 segs @ 2 workers; buffer added
+#SBATCH --output=logs/preprocess.out
+#SBATCH --mail-type=all
+#SBATCH --mail-user=kasrabor@buffalo.edu
+#SBATCH --partition=general-compute
+#SBATCH --qos=general-compute
+#SBATCH --cluster=ub-hpc
+
+# ── paths ─────────────────────────────────────────────────────────────────────
+PROJECT=/projects/academic/alipour/kasrabor/FedMMA-fork
+GCLOUD=/projects/academic/alipour/kasrabor/FedMMA-fork-old/google-cloud-sdk
+CONFIG=/user/kasrabor/.config
+SIF=${PROJECT}/waymo_final.sif
+
+# Final .pt files go here — permanent project storage, not scratch
+OUT_DIR=/projects/academic/alipour/kasrabor/FedMMA-fork/waymo_pt
+
+# ── setup ─────────────────────────────────────────────────────────────────────
+mkdir -p ${PROJECT}/logs
+mkdir -p ${OUT_DIR}
+
+echo "======================================================"
+echo "Job ID     : ${SLURM_JOB_ID}"
+echo "Node       : $(hostname)"
+echo "Start time : $(date)"
+echo "Output dir : ${OUT_DIR}"
+echo "======================================================"
+
+# ── run preprocessing inside the Apptainer container ─────────────────────────
+apptainer exec \
+    --nv \
+    --home  ${PROJECT} \
+    --bind  ${GCLOUD}:/gcloud \
+    --bind  ${CONFIG}:/root/.config \
+    ${SIF} \
+    python3 ${PROJECT}/scripts/preprocess_waymo.py \
+        --split   training \
+        --out_dir ${OUT_DIR} \
+        --workers 2
+
+EXIT_CODE=$?
+
+echo "======================================================"
+echo "End time  : $(date)"
+echo "Exit code : ${EXIT_CODE}"
+echo "======================================================"
+
+exit ${EXIT_CODE}

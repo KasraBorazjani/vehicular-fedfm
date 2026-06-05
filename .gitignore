@@ -1,0 +1,30 @@
+tmp/
+slurms/
+slurm_scripts/
+.vscode/
+__pycache__/
+local_shenanigans/
+waymo_pt/
+logs/
+output/
+
+# environment & tooling
+.claude/
+.conda/
+.cache/
+.config/
+.local/
+.bash_history
+.python_history
+.gsutil/
+.keras/
+.DS_Store
+
+# scratch / local-only files
+test*.py
+inspect_waymo_v2.py
+*.ipynb
+
+# build artefacts
+*.sif
+*.jpg
