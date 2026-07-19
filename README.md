@@ -26,13 +26,13 @@ The model jointly solves four perception tasks spanning camera and LiDAR modalit
 
 ```
                      ┌─────────────────────────────────────────────────────────┐
-                     │                  CustomCLIP  (trainers/mmadapter.py)     │
+                     │                  CustomCLIP  (models/custom_clip.py)      │
                      │                                                           │
   Camera image ─────►│  CLIP ViT-B/16 image encoder  (frozen)                  │
   [B, 3, 224, 224]   │  + modality-specific visual adapters δv at layers 5–12  │──► patch tokens
                      │                                                           │    [B, 196, 512]
                      │                                                           │
-  LiDAR range ───────►│  LiDAREncoder  (clip/lidar_encoder.py)                  │──► patch tokens
+  LiDAR range ───────►│  LiDAREncoder  (models/lidar_encoder.py)                │──► patch tokens
   [B, 3, 224, 224]   │  ├── LiDARInputStem  (conv3×3 + BN, near-identity init) │    [B, 196, 512]
   (null for 2-D tasks)│  └── modality-specific LiDAR adapters δℓ at layers 5–12│
                      │                                                           │
@@ -87,13 +87,17 @@ FedMMA-fork/
 │
 ├── clip/
 │   ├── model_mma.py          # Modified CLIP ViT-B/16: returns patch tokens [B,196,512];
-│   │                         # encode_text accepts adapter_func for adapter injection
-│   ├── lidar_encoder.py      # LiDAREncoder: LiDARInputStem + LiDAR adapters (layers 5–12)
+│   │                         # ModifiedResidualAttentionBlock accepts adapter_func
 │   └── clip.py / model.py    # Original CLIP code (minimally modified)
 │
-├── trainers/
+├── models/
+│   ├── adapters.py           # AdapterBottleneck (δv/δt/δℓ), SharedTaskAdapter
+│   ├── lidar_encoder.py      # LiDAREncoder: LiDARInputStem + LiDAR adapters (layers 5–12)
 │   ├── task_heads.py         # SegHead3D, DetHead3D, PanHead2D, DetHead2D + build_task_heads()
-│   └── mmadapter.py          # CustomCLIP: 3-branch fusion, shared task adapter, null_lidar
+│   └── custom_clip.py        # CustomCLIP: 3-branch fusion, shared task adapter, TextEncoder
+│
+├── trainers/
+│   └── mmadapter.py          # MultiModalAdapter (Dassl TrainerX): training loop only
 │
 ├── datasets/
 │   └── waymo.py              # WaymoMultiTaskDataset: .pt segment loader + collate

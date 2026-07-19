@@ -290,14 +290,10 @@ class VisionTransformer(nn.Module):
             x = self.transformer(x)
 
         x = x.permute(1, 0, 2)  # LND -> NLD
-
-        # Return all patch tokens [B, 196, width] instead of only the CLS token [B, width].
-        # x[:, 0, :] was the CLS token (global summary); x[:, 1:, :] are the 14×14 spatial
-        # patch tokens needed by all four task heads for dense prediction and detection.
-        x = self.ln_post(x[:, 1:, :])
+        x = self.ln_post(x[:, 0, :])
 
         if self.proj is not None:
-            x = x @ self.proj  # [B, 196, width] @ [width, output_dim] → [B, 196, output_dim]
+            x = x @ self.proj
 
         return x
 
@@ -402,33 +398,17 @@ class CLIP(nn.Module):
     def encode_image(self, image):
         return self.visual(image.type(self.dtype))
 
-    def encode_text(self, text, adapter_func=None):
-        """Encode tokenised text prompts → [batch_size, embed_dim].
-
-        Args:
-            text:         LongTensor [batch_size, context_length] of token IDs.
-            adapter_func: optional callable identical in signature to the vision
-                          adapter_func — returns (seq_adapter, shared_adapter, scale)
-                          for a given layer index.  When provided the text transformer
-                          runs with adapter injection; when None it runs frozen.
-        """
-        x = self.token_embedding(text).type(self.dtype)  # [B, n_ctx, d_model]
+    def encode_text(self, text):
+        x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
 
         x = x + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
-
-        # Inject text adapter using the same [x, adapter_func] protocol as the
-        # vision transformer.  ModifiedResidualAttentionBlock already handles this.
-        if adapter_func is not None:
-            x = self.transformer([x, adapter_func])
-        else:
-            x = self.transformer(x)
-
+        x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
 
-        # Extract the EOT token — highest token ID in each sequence.
-        # It has attended to the full sequence and summarises the prompt.
+        # x.shape = [batch_size, n_ctx, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
 
         return x

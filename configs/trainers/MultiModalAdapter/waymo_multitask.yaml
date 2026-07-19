@@ -1,0 +1,54 @@
+MODEL:
+  BACKBONE:
+    NAME: "ViT-B/16"
+  # Number of trainable adapter layers in visual / text / lidar branches.
+  ADAPTER_DIM: 64
+  ADAPTER_START: 5          # first ViT layer to inject adapters (1-indexed)
+  SHARED_ADAPTER_DIM: 64
+  NUM_DECODER_LAYERS: 2     # DETR decoder depth for DetHead2D
+  NUM_QUERIES_3D: 300
+  NUM_QUERIES_2D: 100
+  NUM_QUERIES_PAN: 100
+
+TRAINER:
+  MMADAPTER:
+    PREC: "amp"             # fp16, fp32, amp
+    ADAPTER_SCALE: 0.1
+    ARRIVING_TASK: "seg3d"  # overridden per job
+    # Whether to freeze non-arriving task heads at construction.
+    FREEZE_PRETRAINED_HEADS: true
+    # Set False for NTA (no-task-adapter) ablation.
+    USE_TASK_ADAPTER: true
+
+OPTIM:
+  NAME: "adamw"
+  LR: 1e-4
+  WEIGHT_DECAY: 1e-2
+  LR_SCHEDULER: "cosine"
+  WARMUP_EPOCH: 1
+  MAX_EPOCH: 1              # local_epochs per round; override via --local-epochs
+
+FEDERATED:
+  PHASE1_ROUNDS: 100
+  PHASE2_ROUNDS: 50
+  NUM_CLIENTS: 20
+  CLIENT_FRAC: 1.0          # fraction of clients sampled per round
+  LOCAL_EPOCHS: 1
+  BATCH_SIZE: 8
+  MU: 0.01                  # FedProx proximal coefficient
+  EWC_LAMBDA: 5000          # EWC penalty weight
+  CAGRAD_ALPHA: 0.5         # CAGrad blend (multitask baseline only)
+  GRADNORM_ALPHA: 1.5       # GradNorm relative training rate exponent
+  EVAL_INTERVAL: 10         # evaluate every N rounds
+  SEED: 1
+
+DATALOADER:
+  NUM_WORKERS: 4
+
+TRAIN:
+  PRINT_FREQ: 20
+
+INPUT:
+  SIZE: [224, 224]
+  PIXEL_MEAN: [0.48145466, 0.4578275, 0.40821073]
+  PIXEL_STD: [0.26862954, 0.26130258, 0.27577711]

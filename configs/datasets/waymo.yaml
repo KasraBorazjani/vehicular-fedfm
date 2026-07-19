@@ -1,0 +1,10 @@
+DATASET:
+  NAME: "waymo_multitask"
+  # Absolute path to the directory of preprocessed .pt segment files.
+  # Override at runtime with --pt-dir or the PT_DIR env variable.
+  ROOT: "/projects/academic/alipour/kasrabor/FedMMA-fork/waymo_pt"
+  NUM_CLIENTS: 20
+  PAN_SEQ_LEN: 5
+  EVAL_FRAC: 0.1
+  # Arriving task for this experiment; override per SLURM job.
+  ARRIVING_TASK: "seg3d"

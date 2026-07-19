@@ -20,22 +20,29 @@ STEP 3 — smoke-test a single segment:
       --out_dir /tmp/waymo_test \\
       --max_segs 1
 
-Output layout:
-  {out_dir}/{split}/{segment_id}.pt
+Output layout (one .pt per segment PER CAMERA):
+  {out_dir}/{split}/{segment_id}_cam{camera_id}.pt
+  camera_id ∈ {1:FRONT, 2:FRONT_LEFT, 3:FRONT_RIGHT, 4:SIDE_LEFT, 5:SIDE_RIGHT}
 
 Each .pt is a dict:
   {
     "segment_id": str,
+    "camera_id":  int,
     "split":      str,
     "frames": [
       {
-        "frame_id":      int,              # frame_timestamp_micros
-        "image":         Tensor[3,224,224],  # float16, CLIP-normalized
-        "lidar":         Tensor[3,224,224],  # float16, [range, intensity, elongation]
-        "seg3d_label":   Tensor[224,224]  | None,  # int16,  0–21 classes, 255 = ignore
-        "det3d_boxes":   Tensor[N, 8]     | None,  # float32 (cx,cy,cz,l,w,h,heading,cls)
-        "pan2d_label":   Tensor[224,224]  | None,  # int32,  0–27 classes, 255 = ignore
-        "det2d_boxes":   Tensor[M, 5]     | None,  # float32 (cx_n,cy_n,w_n,h_n,cls)
+        "frame_id":       int,
+        "image":          Tensor[3,224,224],   # float16, CLIP-normalized
+        "lidar":          Tensor[3,224,224],   # float16, [range, intensity, elongation],
+                                                #   scattered into this camera's pixel grid
+                                                #   via the exact LiDAR→camera projection
+                                                #   (see scatter_lidar_to_camera()).
+        "seg3d_label":    Tensor[224,224] | None,  # int16, 0-21, 255=ignore; same projection
+        "det3d_boxes":    Tensor[N,8]            ,  # float32 (cx,cy,cz,sx,sy,sz,heading,cls);
+                                                     #   filtered to this camera's azimuth FOV
+        "pan2d_label":    Tensor[224,224] | None,  # int32, 0-27, 255=ignore
+        "pan2d_instance": Tensor[224,224] | None,  # int32, instance IDs
+        "det2d_boxes":    Tensor[M,5]     | None,  # float32 (cx_n,cy_n,w_n,h_n,cls)
       },
       ...
     ]
@@ -55,7 +62,7 @@ import sys
 from pathlib import Path
 import gc
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -84,16 +91,18 @@ BUCKET = "gs://waymo_open_dataset_v_2_0_1"
 
 # Components we read; values are the GCS subdirectory names
 COMPONENTS = {
-    "lidar":       "lidar",
-    "camera_image":"camera_image",
-    "lidar_seg":   "lidar_segmentation",
-    "lidar_box":   "lidar_box",
-    "camera_seg":  "camera_segmentation",   # optional — absent for 102 segments
-    "camera_box":  "camera_box",            # optional
+    "lidar":            "lidar",
+    "lidar_camera_proj":"lidar_camera_projection",
+    "camera_image":     "camera_image",
+    "lidar_seg":        "lidar_segmentation",
+    "lidar_box":        "lidar_box",
+    "camera_seg":       "camera_segmentation",   # optional — absent for 102 segments
+    "camera_box":       "camera_box",            # optional
 }
 
 # Sensor filter constants (Waymo enum values)
-FRONT_CAM = 1   # CameraName.FRONT
+# CameraName: 1=FRONT 2=FRONT_LEFT 3=FRONT_RIGHT 4=SIDE_LEFT 5=SIDE_RIGHT
+CAMERAS   = [1, 2, 3, 4, 5]
 TOP_LIDAR = 1   # LaserName.TOP
 
 # Target spatial resolution for CLIP ViT-B/16
@@ -189,44 +198,49 @@ for _w, _i in PAN2D_WAYMO_TO_IDX.items():
 
 
 # Loading only the columns we actually use cuts peak RAM by ~60 %:
-    #   • lidar:      skips return2 and all metadata columns
-    #   • camera_image: skips 12 velocity/pose/shutter columns
-    #   • lidar_seg:  skips return2
-    #   • camera_seg: skips instance-mapping and metadata columns
-    NEEDED_COLS = {
-        "lidar": [
-            SEG_KEY, FRAME_KEY, LIDAR_KEY,
-            "[LiDARComponent].range_image_return1.values",
-            "[LiDARComponent].range_image_return1.shape",
-        ],
-        "camera_image": [
-            SEG_KEY, FRAME_KEY, CAM_KEY,
-            "[CameraImageComponent].image",
-        ],
-        "lidar_seg": [
-            SEG_KEY, FRAME_KEY, LIDAR_KEY,
-            "[LiDARSegmentationLabelComponent].range_image_return1.values",
-            "[LiDARSegmentationLabelComponent].range_image_return1.shape",
-        ],
-        "lidar_box": [
-            SEG_KEY, FRAME_KEY,
-            "[LiDARBoxComponent].box.center.x", "[LiDARBoxComponent].box.center.y",
-            "[LiDARBoxComponent].box.center.z", "[LiDARBoxComponent].box.size.x",
-            "[LiDARBoxComponent].box.size.y",   "[LiDARBoxComponent].box.size.z",
-            "[LiDARBoxComponent].box.heading",  "[LiDARBoxComponent].type",
-        ],
-        "camera_seg": [
-            SEG_KEY, FRAME_KEY, CAM_KEY,
-            "[CameraSegmentationLabelComponent].panoptic_label",
-            "[CameraSegmentationLabelComponent].panoptic_label_divisor",
-        ],
-        "camera_box": [
-            SEG_KEY, FRAME_KEY, CAM_KEY,
-            "[CameraBoxComponent].box.center.x", "[CameraBoxComponent].box.center.y",
-            "[CameraBoxComponent].box.size.x",   "[CameraBoxComponent].box.size.y",
-            "[CameraBoxComponent].type",
-        ],
-    }
+#   • lidar:      skips return2 and all metadata columns
+#   • camera_image: skips 12 velocity/pose/shutter columns
+#   • lidar_seg:  skips return2
+#   • camera_seg: skips instance-mapping and metadata columns
+NEEDED_COLS = {
+    "lidar": [
+        SEG_KEY, FRAME_KEY, LIDAR_KEY,
+        "[LiDARComponent].range_image_return1.values",
+        "[LiDARComponent].range_image_return1.shape",
+    ],
+    "lidar_camera_proj": [
+        SEG_KEY, FRAME_KEY, LIDAR_KEY,
+        "[LiDARCameraProjectionComponent].range_image_return1.values",
+        "[LiDARCameraProjectionComponent].range_image_return1.shape",
+    ],
+    "camera_image": [
+        SEG_KEY, FRAME_KEY, CAM_KEY,
+        "[CameraImageComponent].image",
+    ],
+    "lidar_seg": [
+        SEG_KEY, FRAME_KEY, LIDAR_KEY,
+        "[LiDARSegmentationLabelComponent].range_image_return1.values",
+        "[LiDARSegmentationLabelComponent].range_image_return1.shape",
+    ],
+    "lidar_box": [
+        SEG_KEY, FRAME_KEY,
+        "[LiDARBoxComponent].box.center.x", "[LiDARBoxComponent].box.center.y",
+        "[LiDARBoxComponent].box.center.z", "[LiDARBoxComponent].box.size.x",
+        "[LiDARBoxComponent].box.size.y",   "[LiDARBoxComponent].box.size.z",
+        "[LiDARBoxComponent].box.heading",  "[LiDARBoxComponent].type",
+    ],
+    "camera_seg": [
+        SEG_KEY, FRAME_KEY, CAM_KEY,
+        "[CameraSegmentationLabelComponent].panoptic_label",
+        "[CameraSegmentationLabelComponent].panoptic_label_divisor",
+    ],
+    "camera_box": [
+        SEG_KEY, FRAME_KEY, CAM_KEY,
+        "[CameraBoxComponent].box.center.x", "[CameraBoxComponent].box.center.y",
+        "[CameraBoxComponent].box.size.x",   "[CameraBoxComponent].box.size.y",
+        "[CameraBoxComponent].type",
+    ],
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GCS HELPERS
@@ -300,6 +314,13 @@ def resolve_columns(df_columns: List[str]) -> dict:
         # Shape column is a struct; use _parse_shape() to extract dims.
         "ri_values":   ["[LiDARComponent].range_image_return1.values"],
         "ri_shape":    ["[LiDARComponent].range_image_return1.shape"],
+
+        # ── lidar_camera_projection ───────────────────────────────────────────
+        # [H, W, 6] per range-image pixel: (cam1_name, cam1_u, cam1_v,
+        #                                    cam2_name, cam2_u, cam2_v)
+        # -1 in a *_name slot means no projection for that slot.
+        "proj_values": ["[LiDARCameraProjectionComponent].range_image_return1.values"],
+        "proj_shape":  ["[LiDARCameraProjectionComponent].range_image_return1.shape"],
 
         # ── lidar_segmentation ────────────────────────────────────────────────
         "seg_values":  ["[LiDARSegmentationLabelComponent].range_image_return1.values"],
@@ -390,76 +411,148 @@ def decode_and_resize_jpeg(jpeg_bytes: bytes,
 # ══════════════════════════════════════════════════════════════════════════════
 # LIDAR PROCESSING
 # ══════════════════════════════════════════════════════════════════════════════
+#
+# Instead of resizing the full 360° range image (most of which the camera
+# never sees), every LiDAR-derived tensor is scattered directly into the
+# target camera's pixel grid using the exact lidar_camera_projection
+# component — no hardcoded per-camera FOV angles needed.
 
-def parse_range_image(values, shape_val, size: int = IMG_SIZE) -> Optional[np.ndarray]:
-    """
-    Decode a flattened Waymo range image → float32 [3, size, size].
-
-    Input  : values    — flat list/array of floats (length H*W*C)
-             shape_val — raw value of the '.shape' Parquet column
-                         (list, numpy array, or dict — handled by _parse_shape)
-    Output : float32 [3, size, size]  channels = [range, intensity, elongation],
-             each normalised to [0, 1].  Invalid points (range ≤ 0) are zeroed.
-    Returns None on error.
-    """
+def _parse_projection(proj_values, proj_shape, H: int, W: int) -> Optional[np.ndarray]:
+    """Parse the lidar_camera_projection range image → float32 [H, W, 6]."""
     try:
-        dims = _parse_shape(shape_val)
+        dims = _parse_shape(proj_shape)
         if dims is None:
-            # Fallback: infer shape from value count assuming TOP LiDAR geometry
-            n = len(values)
-            dims = [64, n // (64 * 4), 4]
-            log.debug(f"parse_range_image: shape not parsed, inferred {dims}")
-        arr  = np.array(values, dtype=np.float32).reshape(dims) # [H, W, C]
-
-        valid = arr[..., 0] > 0   # valid points have positive range
-
-        ri = arr[..., :3].copy()
-        ri[..., 0] = np.clip(ri[..., 0], 0.0, LIDAR_RANGE_MAX)  / LIDAR_RANGE_MAX
-        ri[..., 1] = np.clip(ri[..., 1], 0.0, LIDAR_INTENS_MAX) / LIDAR_INTENS_MAX
-        ri[..., 2] = np.clip(ri[..., 2], 0.0, LIDAR_ELONG_MAX)  / LIDAR_ELONG_MAX
-        ri[~valid] = 0.0
-
-        # Resize via PIL (treats [H,W,3] as uint8 RGB for interpolation)
-        ri_u8  = (ri * 255.0).clip(0, 255).astype(np.uint8)
-        ri_img = Image.fromarray(ri_u8).resize((size, size), Image.Resampling.BILINEAR)
-        out    = np.array(ri_img, dtype=np.float32) / 255.0      # [size,size,3]
-        return out.transpose(2, 0, 1)                             # [3,size,size]
+            dims = [H, W, 6]
+        return np.array(proj_values, dtype=np.float32).reshape(dims)
     except Exception as e:
-        log.debug(f"parse_range_image error: {e}")
+        log.debug(f"_parse_projection error: {e}")
         return None
 
 
-def parse_seg3d_label(values, shape_val, size: int = IMG_SIZE) -> Optional[np.ndarray]:
+def _camera_hit_slots(proj: np.ndarray, cam_id: int) -> List[Tuple[np.ndarray, int, int]]:
     """
-    Decode a Waymo lidar_segmentation range image → int16 [size, size].
+    Channels of `proj` are (cam1_name, cam1_u, cam1_v, cam2_name, cam2_u, cam2_v).
+    Returns a list of (boolean mask [H,W], u_channel, v_channel) for whichever
+    of the two projection slots matches cam_id (a range-image pixel can project
+    onto two cameras in their overlap region, so both slots are checked).
+    """
+    hits = []
+    for cam_slot, u_slot, v_slot in ((0, 1, 2), (3, 4, 5)):
+        mask = proj[..., cam_slot].astype(np.int32) == cam_id
+        if mask.any():
+            hits.append((mask, u_slot, v_slot))
+    return hits
 
-    Waymo semantic label IDs 1–22 → our 0-based indices 0–21.
-    Undefined (ID 0) and unknown IDs → SEG3D_IGNORE (255).
-    Resize with nearest-neighbour interpolation.
+
+def scatter_lidar_to_camera(
+    ri_values, ri_shape, proj_values, proj_shape,
+    cam_id: int, orig_w: int, orig_h: int, size: int = IMG_SIZE,
+) -> Optional[np.ndarray]:
+    """
+    Scatter TOP LiDAR returns into this camera's pixel grid via the exact
+    LiDAR→camera projection. Each projected return lands at its (u, v) pixel
+    in the *original* camera image, rescaled by size/orig_w, size/orig_h —
+    the same scale factor applied when the camera image itself was resized.
+    Pixels with no projected return are zero. Where two returns land on the
+    same output pixel, the nearer one (smaller range) wins.
+
+    Output : float32 [3, size, size], channels = [range, intensity, elongation],
+             each normalised to [0, 1]. Returns None on error.
     """
     try:
-        dims = _parse_shape(shape_val)
+        dims = _parse_shape(ri_shape)
         if dims is None:
-            n = len(values)
-            dims = [64, n // 64]   # lidar_seg shape is [H, W] (no channel dim)
-            log.debug(f"parse_seg3d_label: shape not parsed, inferred {dims}")
-        # Waymo v2 lidar_segmentation stores [H, W, 2]:
-        #   channel 0 = instance ID (arbitrary integers)
-        #   channel 1 = semantic class (1–22; 0 = unlabelled)
-        # Confirmed by diagnose_seg3d.py: shape=[64, 2650, 2], len(values)=339200.
-        arr = np.array(values, dtype=np.int32).reshape(dims)
-        if arr.ndim == 3:
-            arr = arr[..., 1]   # [H, W] — semantic class channel
+            n = len(ri_values)
+            dims = [64, n // (64 * 4), 4]
+        ri = np.array(ri_values, dtype=np.float32).reshape(dims)   # [H, W, C]
+        H, W = ri.shape[:2]
 
-        # Vectorised remap via LUT (capped at 255 for safety)
-        arr_clipped = np.clip(arr, 0, 255).astype(np.uint8)
-        out = _SEG3D_LUT[arr_clipped]                             # [H, W] int16
+        proj = _parse_projection(proj_values, proj_shape, H, W)
+        if proj is None:
+            return None
 
-        # Nearest-neighbour resize: encode as uint8 (values 0-21 and 255 fit)
-        lbl_img = Image.fromarray(out.astype(np.uint8)).resize((size, size), Image.Resampling.NEAREST)
-        return np.array(lbl_img, dtype=np.int16)
+        valid   = ri[..., 0] > 0.0
+        ri_norm = ri[..., :3].copy()
+        ri_norm[..., 0] = np.clip(ri_norm[..., 0], 0.0, LIDAR_RANGE_MAX)  / LIDAR_RANGE_MAX
+        ri_norm[..., 1] = np.clip(ri_norm[..., 1], 0.0, LIDAR_INTENS_MAX) / LIDAR_INTENS_MAX
+        ri_norm[..., 2] = np.clip(ri_norm[..., 2], 0.0, LIDAR_ELONG_MAX)  / LIDAR_ELONG_MAX
+
+        out = np.zeros((3, size, size), dtype=np.float32)
+
+        us_all, vs_all, r_all, val_all = [], [], [], []
+        for mask, u_slot, v_slot in _camera_hit_slots(proj, cam_id):
+            m = mask & valid
+            if not m.any():
+                continue
+            us_all.append(proj[..., u_slot][m])
+            vs_all.append(proj[..., v_slot][m])
+            r_all.append(ri[..., 0][m])
+            val_all.append(ri_norm[m])
+
+        if not us_all:
+            return out   # no LiDAR returns project onto this camera this frame
+
+        u    = np.concatenate(us_all)
+        v    = np.concatenate(vs_all)
+        r    = np.concatenate(r_all)
+        vals = np.concatenate(val_all)   # [N, 3]
+
+        us = np.clip((u * size / orig_w).astype(np.int64), 0, size - 1)
+        vs = np.clip((v * size / orig_h).astype(np.int64), 0, size - 1)
+
+        # Farthest-first so the nearest return overwrites at shared pixels
+        order = np.argsort(r)[::-1]
+        out[:, vs[order], us[order]] = vals[order].T
+        return out
     except Exception as e:
-        log.debug(f"parse_seg3d_label error: {e}")
+        log.debug(f"scatter_lidar_to_camera error: {e}")
+        return None
+
+
+def parse_seg3d_label_for_camera(
+    seg_values, seg_shape, proj_values, proj_shape,
+    cam_id: int, orig_w: int, orig_h: int, size: int = IMG_SIZE,
+) -> Optional[np.ndarray]:
+    """
+    Scatter Waymo lidar_segmentation semantic labels into this camera's pixel
+    grid via the same LiDAR→camera projection as scatter_lidar_to_camera(),
+    so the label and the LiDAR/image tensors stay pixel-aligned.
+
+    Waymo semantic label IDs 1–22 → our 0-based indices 0–21.
+    Pixels with no projected LiDAR return → SEG3D_IGNORE (255).
+    Output: int16 [size, size]. Returns None on error.
+    """
+    try:
+        dims = _parse_shape(seg_shape)
+        if dims is None:
+            n = len(seg_values)
+            dims = [64, n // 64]   # lidar_seg shape is [H, W] (no channel dim)
+            log.debug(f"parse_seg3d_label_for_camera: shape not parsed, inferred {dims}")
+        # Waymo v2 lidar_segmentation stores [H, W, 2]:
+        #   channel 0 = instance ID, channel 1 = semantic class (1–22; 0 = unlabelled)
+        arr = np.array(seg_values, dtype=np.int32).reshape(dims)
+        sem = arr[..., 1] if arr.ndim == 3 else arr   # [H, W] semantic channel
+        H, W = sem.shape
+
+        proj = _parse_projection(proj_values, proj_shape, H, W)
+        if proj is None:
+            return None
+
+        out = np.full((size, size), SEG3D_IGNORE, dtype=np.int16)
+
+        for mask, u_slot, v_slot in _camera_hit_slots(proj, cam_id):
+            u        = proj[..., u_slot][mask]
+            v        = proj[..., v_slot][mask]
+            labels   = np.clip(sem[mask], 0, 255).astype(np.uint8)
+            remapped = _SEG3D_LUT[labels]
+
+            us = np.clip((u * size / orig_w).astype(np.int64), 0, size - 1)
+            vs = np.clip((v * size / orig_h).astype(np.int64), 0, size - 1)
+            out[vs, us] = remapped
+
+        return out
+    except Exception as e:
+        log.debug(f"parse_seg3d_label_for_camera error: {e}")
         return None
 
 
@@ -498,6 +591,41 @@ def parse_det3d_boxes(df: pd.DataFrame, col: dict) -> torch.Tensor:
     return torch.tensor(boxes, dtype=torch.float32)
 
 
+def filter_det3d_boxes_for_camera(
+    boxes_t: torch.Tensor, proj_values, proj_shape, cam_id: int,
+) -> torch.Tensor:
+    """
+    Keep only det3d boxes whose ego-frame center azimuth falls within the
+    azimuth span of range-image columns that project onto cam_id — derived
+    directly from the projection map, no hardcoded camera FOV.
+
+    boxes_t: [N, 8] float32 (cx,cy,cz,sx,sy,sz,heading,cls). Returns [K, 8].
+    """
+    if boxes_t.shape[0] == 0:
+        return boxes_t
+    try:
+        dims = _parse_shape(proj_shape)
+        proj = np.array(proj_values, dtype=np.float32).reshape(dims)   # [H, W, 6]
+        W    = proj.shape[1]
+
+        col_hit = ((proj[..., 0].astype(np.int32) == cam_id) |
+                   (proj[..., 3].astype(np.int32) == cam_id)).any(axis=0)   # [W]
+        cam_cols = np.where(col_hit)[0]
+        if cam_cols.size == 0:
+            return torch.zeros(0, 8, dtype=torch.float32)
+
+        azimuths = np.linspace(np.pi, -np.pi, W, endpoint=False, dtype=np.float32)
+        az_lo, az_hi = float(azimuths[cam_cols].min()), float(azimuths[cam_cols].max())
+
+        boxes_np = boxes_t.numpy()
+        box_az   = np.arctan2(boxes_np[:, 1], boxes_np[:, 0])
+        keep     = (box_az >= az_lo) & (box_az <= az_hi)
+        return torch.from_numpy(boxes_np[keep].copy())
+    except Exception as e:
+        log.debug(f"filter_det3d_boxes_for_camera error: {e}")
+        return boxes_t
+
+
 def parse_det2d_boxes(df: pd.DataFrame, col: dict,
                       img_w: int = 1920, img_h: int = 1280) -> torch.Tensor:
     """
@@ -534,31 +662,42 @@ def parse_det2d_boxes(df: pd.DataFrame, col: dict,
 # PANOPTIC LABEL PROCESSING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def parse_pan2d_label(png_bytes: bytes, divisor: int,
-                      size: int = IMG_SIZE) -> Optional[np.ndarray]:
+def parse_pan2d_label(
+    png_bytes: bytes,
+    divisor:   int,
+    size:      int = IMG_SIZE,
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     """
-    Decode a Waymo camera_segmentation panoptic PNG → int32 [size, size].
+    Decode a Waymo camera_segmentation panoptic PNG.
 
     Waymo stores a uint32 panoptic label where:
         semantic_id = panoptic_value // divisor
-        instance_id = panoptic_value  % divisor
+        instance_id = panoptic_value  % divisor   (0 = stuff / no instance)
 
-    We keep only semantic_id, remap via PAN2D_WAYMO_TO_IDX, and resize
-    with nearest-neighbour interpolation.
+    Returns (semantic_arr, instance_arr) both int32 [size, size], or None.
+    semantic_arr : 0-27 remapped classes, 255 = ignore
+    instance_arr : raw Waymo instance IDs (0 = stuff; >0 = trackable things)
     """
     try:
-        pan_img = Image.open(io.BytesIO(png_bytes))
-        pan_arr = np.array(pan_img, dtype=np.int32)   # uint32 stored as int32
-        sem_arr = pan_arr // divisor                   # semantic label per pixel
+        pan_img  = Image.open(io.BytesIO(png_bytes))
+        pan_arr  = np.array(pan_img, dtype=np.int32)   # uint32 stored as int32
+        sem_arr  = pan_arr // divisor                   # semantic label per pixel
+        inst_arr = pan_arr % divisor                    # instance ID per pixel
 
-        # Vectorised remap; clamp out-of-range IDs to 0 (→ IGNORE via LUT)
+        # Remap semantic labels via LUT
         sem_clipped = np.clip(sem_arr, 0, 255).astype(np.uint8)
-        out = _PAN2D_LUT[sem_clipped]                  # int32 [H, W]
+        sem_out     = _PAN2D_LUT[sem_clipped]           # int32 [H, W]
 
-        # Nearest-neighbour resize (values are class indices, not intensities)
-        # encode as uint16 to preserve 255 sentinel safely
-        out_img = Image.fromarray(out.astype(np.uint16)).resize((size, size), Image.Resampling.NEAREST)
-        return np.array(out_img, dtype=np.int32)
+        # Nearest-neighbour resize — PIL mode 'I' preserves int32 exactly
+        sem_out  = np.array(
+            Image.fromarray(sem_out,  mode="I").resize((size, size), Image.Resampling.NEAREST),
+            dtype=np.int32,
+        )
+        inst_out = np.array(
+            Image.fromarray(inst_arr, mode="I").resize((size, size), Image.Resampling.NEAREST),
+            dtype=np.int32,
+        )
+        return sem_out, inst_out
     except Exception as e:
         log.debug(f"parse_pan2d_label error: {e}")
         return None
@@ -570,14 +709,14 @@ def parse_pan2d_label(png_bytes: bytes, divisor: int,
 
 def preprocess_segment(seg_id: str, split: str, out_dir: Path) -> bool:
     """
-    Download, decode, and save one segment as a .pt file.
+    Download, decode, and save one segment as one .pt file PER CAMERA.
 
     Returns True on success, False on failure.
-    The output file is atomic (written to a .tmp path, then renamed).
+    Output files are atomic (written to a .tmp path, then renamed).
     """
-    out_path = out_dir / f"{seg_id}.pt"
-    if out_path.exists():
-        log.info(f"SKIP  {seg_id[:36]}… (already exists)")
+    out_paths = {cam_id: out_dir / f"{seg_id}_cam{cam_id}.pt" for cam_id in CAMERAS}
+    if all(p.exists() for p in out_paths.values()):
+        log.info(f"SKIP  {seg_id[:36]}… (all cameras already exist)")
         return True
 
     log.info(f"START {seg_id[:36]}…")
@@ -600,6 +739,7 @@ def preprocess_segment(seg_id: str, split: str, out_dir: Path) -> bool:
     # ── 2. Resolve column names from actual schemas ───────────────────────────
     col_cam    = resolve_columns(dfs["camera_image"].columns.tolist())
     col_lidar  = resolve_columns(dfs["lidar"].columns.tolist())
+    col_proj   = resolve_columns(dfs["lidar_camera_proj"].columns.tolist())
     col_seg    = resolve_columns(dfs["lidar_seg"].columns.tolist())
     col_box3d  = resolve_columns(dfs["lidar_box"].columns.tolist())
     col_camseg = resolve_columns(dfs["camera_seg"].columns.tolist()) if dfs["camera_seg"] is not None else {}
@@ -608,116 +748,142 @@ def preprocess_segment(seg_id: str, split: str, out_dir: Path) -> bool:
     # ── 3. Enumerate frames (by unique timestamps in the lidar component) ──────
     frame_ids = sorted(dfs["lidar"][FRAME_KEY].unique().tolist())
 
-    frames = []
+    frames_by_cam: dict = {cam_id: [] for cam_id in CAMERAS}
+
     for fid in frame_ids:
 
-        # ── camera image (FRONT only) ─────────────────────────────────────────
-        cam_rows = dfs["camera_image"][
-            (dfs["camera_image"][FRAME_KEY] == fid) &
-            (dfs["camera_image"][CAM_KEY]   == FRONT_CAM)
-        ]
-        if cam_rows.empty:
-            continue   # no FRONT camera for this frame — skip
-        cam_row = cam_rows.iloc[0]
-
-        if col_cam.get("cam_image") is None:
-            log.warning(f"  Frame {fid}: camera image column unresolved — skipping frame. "
-                        f"Run --discover to see actual columns.")
-            continue
-
-        # decode_and_resize_jpeg returns (array, orig_w, orig_h)
-        img_arr, img_w, img_h = decode_and_resize_jpeg(bytes(cam_row[col_cam["cam_image"]]))
-        image_t = torch.from_numpy(img_arr).to(torch.float16)   # [3,224,224]
-
-        # ── TOP LiDAR range image ─────────────────────────────────────────────
+        # ── TOP LiDAR range image (shared across all cameras) ─────────────────
         lidar_rows = dfs["lidar"][
-            (dfs["lidar"][FRAME_KEY]  == fid) &
-            (dfs["lidar"][LIDAR_KEY]  == TOP_LIDAR)
+            (dfs["lidar"][FRAME_KEY] == fid) &
+            (dfs["lidar"][LIDAR_KEY] == TOP_LIDAR)
         ]
         if lidar_rows.empty:
             continue   # no TOP LiDAR — skip frame
-        lidar_row = lidar_rows.iloc[0]
-
         if col_lidar.get("ri_values") is None or col_lidar.get("ri_shape") is None:
             log.warning(f"  Frame {fid}: lidar range-image columns unresolved — skipping frame.")
             continue
+        lidar_row = lidar_rows.iloc[0]
+        ri_values = lidar_row[col_lidar["ri_values"]]
+        ri_shape  = lidar_row[col_lidar["ri_shape"]]
 
-        lidar_arr = parse_range_image(lidar_row[col_lidar["ri_values"]],
-                                      lidar_row[col_lidar["ri_shape"]])
-        if lidar_arr is None:
-            continue
-        lidar_t = torch.from_numpy(lidar_arr).to(torch.float16)  # [3,224,224]
-
-        # ── seg3d label ───────────────────────────────────────────────────────
-        seg3d_t = None
-        seg_rows = dfs["lidar_seg"][
-            (dfs["lidar_seg"][FRAME_KEY]  == fid) &
-            (dfs["lidar_seg"][LIDAR_KEY]  == TOP_LIDAR)
+        # ── LiDAR→camera projection map (shared across all cameras) ───────────
+        proj_rows = dfs["lidar_camera_proj"][
+            (dfs["lidar_camera_proj"][FRAME_KEY] == fid) &
+            (dfs["lidar_camera_proj"][LIDAR_KEY] == TOP_LIDAR)
         ]
-        if not seg_rows.empty and col_seg.get("seg_values") and col_seg.get("seg_shape"):
-            seg_row = seg_rows.iloc[0]
-            seg_arr = parse_seg3d_label(seg_row[col_seg["seg_values"]],
-                                         seg_row[col_seg["seg_shape"]])
-            if seg_arr is not None:
-                seg3d_t = torch.from_numpy(seg_arr)  # int16 [224,224]
+        if proj_rows.empty or col_proj.get("proj_values") is None or col_proj.get("proj_shape") is None:
+            log.debug(f"  Frame {fid}: no camera projection data — skipping frame.")
+            continue
+        proj_row    = proj_rows.iloc[0]
+        proj_values = proj_row[col_proj["proj_values"]]
+        proj_shape  = proj_row[col_proj["proj_shape"]]
 
-        # ── det3d boxes ───────────────────────────────────────────────────────
-        box3d_rows = dfs["lidar_box"][dfs["lidar_box"][FRAME_KEY] == fid]
-        det3d_t = parse_det3d_boxes(box3d_rows, col_box3d)  # float32 [N,8]
+        # ── seg3d range-image label (shared; scattered per camera below) ──────
+        seg_rows = dfs["lidar_seg"][
+            (dfs["lidar_seg"][FRAME_KEY] == fid) &
+            (dfs["lidar_seg"][LIDAR_KEY] == TOP_LIDAR)
+        ]
+        has_seg3d = (not seg_rows.empty
+                     and col_seg.get("seg_values") is not None
+                     and col_seg.get("seg_shape") is not None)
+        seg_row = seg_rows.iloc[0] if has_seg3d else None
 
-        # ── pan2d label ───────────────────────────────────────────────────────
-        pan2d_t = None
-        if dfs["camera_seg"] is not None and col_camseg.get("pan_label") and col_camseg.get("pan_divisor"):
-            camseg_rows = dfs["camera_seg"][
-                (dfs["camera_seg"][FRAME_KEY] == fid) &
-                (dfs["camera_seg"][CAM_KEY]   == FRONT_CAM)
+        # ── det3d boxes (shared; FOV-filtered per camera below) ───────────────
+        box3d_rows  = dfs["lidar_box"][dfs["lidar_box"][FRAME_KEY] == fid]
+        det3d_all_t = parse_det3d_boxes(box3d_rows, col_box3d)   # float32 [N,8]
+
+        # ── per-camera processing ──────────────────────────────────────────────
+        for cam_id in CAMERAS:
+            cam_rows = dfs["camera_image"][
+                (dfs["camera_image"][FRAME_KEY] == fid) &
+                (dfs["camera_image"][CAM_KEY]   == cam_id)
             ]
-            if not camseg_rows.empty:
-                cs_row = camseg_rows.iloc[0]
-                pan_arr = parse_pan2d_label(bytes(cs_row[col_camseg["pan_label"]]),
-                                             int(cs_row[col_camseg["pan_divisor"]]))
-                if pan_arr is not None:
-                    pan2d_t = torch.from_numpy(pan_arr)   # int32 [224,224]
+            if cam_rows.empty or col_cam.get("cam_image") is None:
+                continue   # this camera has no image for this frame — skip
+            cam_row = cam_rows.iloc[0]
 
-        # ── det2d boxes ───────────────────────────────────────────────────────
-        det2d_t = None
-        if dfs["camera_box"] is not None:
-            cambox_rows = dfs["camera_box"][
-                (dfs["camera_box"][FRAME_KEY] == fid) &
-                (dfs["camera_box"][CAM_KEY]   == FRONT_CAM)
-            ]
-            det2d_t = parse_det2d_boxes(cambox_rows, col_box2d, img_w, img_h)
+            # decode_and_resize_jpeg returns (array, orig_w, orig_h)
+            img_arr, img_w, img_h = decode_and_resize_jpeg(bytes(cam_row[col_cam["cam_image"]]))
+            image_t = torch.from_numpy(img_arr).to(torch.float16)   # [3,224,224]
 
-        # ── assemble frame dict ───────────────────────────────────────────────
-        frames.append({
-            "frame_id":    int(fid),
-            "image":       image_t,
-            "lidar":       lidar_t,
-            "seg3d_label": seg3d_t,
-            "det3d_boxes": det3d_t,
-            "pan2d_label": pan2d_t,
-            "det2d_boxes": det2d_t,
-        })
+            lidar_arr = scatter_lidar_to_camera(
+                ri_values, ri_shape, proj_values, proj_shape, cam_id, img_w, img_h)
+            if lidar_arr is None:
+                continue
+            lidar_t = torch.from_numpy(lidar_arr).to(torch.float16)  # [3,224,224]
+
+            seg3d_t = None
+            if has_seg3d:
+                seg_arr = parse_seg3d_label_for_camera(
+                    seg_row[col_seg["seg_values"]], seg_row[col_seg["seg_shape"]],
+                    proj_values, proj_shape, cam_id, img_w, img_h)
+                if seg_arr is not None:
+                    seg3d_t = torch.from_numpy(seg_arr)  # int16 [224,224]
+
+            det3d_t = filter_det3d_boxes_for_camera(
+                det3d_all_t, proj_values, proj_shape, cam_id)   # float32 [K,8]
+
+            # ── pan2d semantic label + instance IDs ───────────────────────────
+            pan2d_t          = None
+            pan2d_instance_t = None
+            if dfs["camera_seg"] is not None and col_camseg.get("pan_label") and col_camseg.get("pan_divisor"):
+                camseg_rows = dfs["camera_seg"][
+                    (dfs["camera_seg"][FRAME_KEY] == fid) &
+                    (dfs["camera_seg"][CAM_KEY]   == cam_id)
+                ]
+                if not camseg_rows.empty:
+                    cs_row = camseg_rows.iloc[0]
+                    result = parse_pan2d_label(bytes(cs_row[col_camseg["pan_label"]]),
+                                               int(cs_row[col_camseg["pan_divisor"]]))
+                    if result is not None:
+                        sem_arr, inst_arr = result
+                        pan2d_t          = torch.from_numpy(sem_arr)   # int32 [224,224]
+                        pan2d_instance_t = torch.from_numpy(inst_arr)  # int32 [224,224]
+
+            # ── det2d boxes ────────────────────────────────────────────────────
+            det2d_t = None
+            if dfs["camera_box"] is not None:
+                cambox_rows = dfs["camera_box"][
+                    (dfs["camera_box"][FRAME_KEY] == fid) &
+                    (dfs["camera_box"][CAM_KEY]   == cam_id)
+                ]
+                det2d_t = parse_det2d_boxes(cambox_rows, col_box2d, img_w, img_h)
+
+            frames_by_cam[cam_id].append({
+                "frame_id":       int(fid),
+                "image":          image_t,
+                "lidar":          lidar_t,
+                "seg3d_label":    seg3d_t,
+                "det3d_boxes":    det3d_t,
+                "pan2d_label":    pan2d_t,
+                "pan2d_instance": pan2d_instance_t,
+                "det2d_boxes":    det2d_t,
+            })
 
     # ── free DataFrames — they can be 1–2 GB total; don't wait for GC ───────────
     del dfs
     gc.collect()
 
-    if not frames:
-        log.warning(f"  {seg_id[:36]}: 0 valid frames — not saved")
-        return False
+    # ── 4. Atomic save, one file per camera ────────────────────────────────────
+    n_saved = 0
+    for cam_id, frames in frames_by_cam.items():
+        if not frames:
+            continue
+        out_path = out_paths[cam_id]
+        payload  = {"segment_id": seg_id, "camera_id": cam_id, "split": split, "frames": frames}
+        tmp_path = out_path.with_suffix(".pt.tmp")
+        torch.save(payload, tmp_path)
+        tmp_path.rename(out_path)
+        log.info(f"SAVED {seg_id[:36]} cam{cam_id} — {len(frames)} frames → {out_path.name}")
+        n_saved += 1
 
-    # ── 4. Atomic save ────────────────────────────────────────────────────────
-    payload  = {"segment_id": seg_id, "split": split, "frames": frames}
-    tmp_path = out_path.with_suffix(".pt.tmp")
-    torch.save(payload, tmp_path)
-    tmp_path.rename(out_path)
-
-    n_frames = len(frames)
-    del frames, payload   # free tensors before next segment starts
+    del frames_by_cam
     gc.collect()
 
-    log.info(f"SAVED {seg_id[:36]} — {n_frames} frames → {out_path.name}")
+    if n_saved == 0:
+        log.warning(f"  {seg_id[:36]}: 0 valid frames for any camera — not saved")
+        return False
+
     return True
 
 
